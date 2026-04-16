@@ -1,0 +1,59 @@
+# =============================================================================
+#  Tennis Analysis Pipeline — Configuration
+#  config.yaml
+# =============================================================================
+#
+# home_dir
+# --------
+# Absolute path to the small-app root directory.
+# Leave BLANK (or remove the line) to auto-detect from this file's location —
+# this works as long as you run scripts from inside small-app/ or use the
+# run_pipeline.bat / run_pipeline.sh launchers.
+#
+# Examples:
+#   home_dir: "D:/projects/tennis/small-app"
+#   home_dir: "C:/Users/alice/repos/tennis/small-app"
+#   home_dir: "/opt/tennis/small-app"
+#
+home_dir: ""
+
+# =============================================================================
+#  Camera configuration
+# =============================================================================
+cameras:
+  cam66:
+    rtsp_url:       "rtsp://admin:motion168@192.168.1.66:554/Streaming/Channels/101"
+    homography_key: cam66
+    y_net:          238.0      # pixel V-coordinate of the net in cam66 view
+    serial:         FV9942593  # device serial number for API reporting
+
+  cam68:
+    rtsp_url:       "rtsp://admin:motion168@192.168.1.68:554/Streaming/Channels/101"
+    homography_key: cam68
+    y_net:          285.0
+    serial:         FV9942588
+
+# =============================================================================
+#  Model / inference settings
+# =============================================================================
+model:
+  path:       "model_weights/TrackNet_finetuned.pt"   # relative to home_dir
+  wasb_path:  "model_weights/wasb_tennis_best.pth.tar"
+  yolo_path:  "model_weights/yolo26x-pose.pt"
+  device:     "cuda"    # "cuda" or "cpu"
+  fps:        25.0
+  frames_in:  8
+  frames_out: 8
+  threshold:  0.3
+
+# =============================================================================
+#  Directory / file paths  (all relative to home_dir)
+# =============================================================================
+paths:
+  uploads:    "uploads"
+  output:     "output"
+  weights:    "model_weights"
+
+  homography: "uploads/homography_matrices.json"
+  calib_cam66: "uploads/cal_cam66.json"
+  calib_cam68: "uploads/cal_cam68.json"

@@ -1,0 +1,3 @@
+camera,ball_interp_mae_px,ball_interp_rmse_px,ball_interp_u_mae,ball_interp_v_mae,outlier_agree_rate,interp_agree_rate,p0_ls_mae_px,p0_rs_mae_px,p0_le_mae_px,p0_re_mae_px,p0_lw_mae_px,p0_rw_mae_px,p0_avg_joint_mae_px,p1_ls_mae_px,p1_rs_mae_px,p1_le_mae_px,p1_re_mae_px,p1_lw_mae_px,p1_rw_mae_px,p1_avg_joint_mae_px
+cam66,0.0,0.0,0.0,0.0,1.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+cam68,0.0,0.0,0.0,0.0,1.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0

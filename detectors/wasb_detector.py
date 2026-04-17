@@ -120,3 +120,37 @@ class WASBDetector:
         v = float(v_model) * (orig_h / INP_H)
 
         return conf >= conf_threshold, u, v, float(conf)
+
+    @torch.no_grad()
+    def detect_batch(
+        self,
+        buffer: deque,
+        orig_h: int,
+        orig_w: int,
+        conf_threshold: float = 0.5,
+    ) -> list[tuple[bool, float, float, float]]:
+        """Run inference once and return results for all frames_in frames.
+
+        Used in non-overlapping batch mode: caller accumulates exactly
+        frames_in frames, calls this method, then clears the buffer.
+
+        Returns
+        -------
+        List of (detected, u, v, confidence) – one entry per input frame,
+        in the same order as the frames were pushed into *buffer*.
+        """
+        x = torch.cat(list(buffer), dim=0).unsqueeze(0).to(self.device)
+        out = self.model(x)
+        heatmaps = out[0][0]  # [frames_in, INP_H, INP_W]
+
+        results: list[tuple[bool, float, float, float]] = []
+        for i in range(heatmaps.shape[0]):
+            conf_map = torch.sigmoid(heatmaps[i])
+            flat_idx = int(conf_map.argmax().item())
+            v_model  = flat_idx // INP_W
+            u_model  = flat_idx  % INP_W
+            conf     = float(conf_map[v_model, u_model].item())
+            u        = float(u_model) * (orig_w / INP_W)
+            v        = float(v_model) * (orig_h / INP_H)
+            results.append((conf >= conf_threshold, u, v, conf))
+        return results

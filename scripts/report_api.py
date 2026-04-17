@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION  — edit these values if the mapping changes
 # =============================================================================
 
-API_URL = "https://tennis.madingyu.com/api/admin/SpaceParties/reportData"
+API_URL = "https://tennisync.top/api/admin/SpaceParties/reportData"
 
 # Camera label → device serial number
 CAMERA_SERIALS: dict[str, str] = {
@@ -346,7 +346,7 @@ def _post_payload(payload: dict, api_url: str, dry_run: bool = False) -> bool:
 
     if dry_run:
         logger.info("[DRY-RUN] serial=%s  %s → %s", serial, start, end)
-        logger.debug(json.dumps(payload, indent=2, ensure_ascii=False))
+        logger.info("PAYLOAD:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
         return True
 
     if _requests is None:

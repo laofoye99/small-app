@@ -146,7 +146,7 @@ def _cos_sim(du1, dv1, du2, dv2):
 # Rules 1-5  (point-level, iterative)
 # ---------------------------------------------------------------------------
 
-def flag_point_outliers(df, spd):
+def flag_point_outliers(df, spd, conf_thr: float = CONF_THR):
     df = df.copy()
     df['clean_u']      = np.where(df['detected'] == 1, df['ball_u'], np.nan)
     df['clean_v']      = np.where(df['detected'] == 1, df['ball_v'], np.nan)
@@ -162,10 +162,11 @@ def flag_point_outliers(df, spd):
         df.loc[idx, 'clean_u'] = np.nan
         df.loc[idx, 'clean_v'] = np.nan
 
-    # R1: low confidence
-    for idx in det_idx:
-        if df.loc[idx, 'ball_conf'] < CONF_THR:
-            _set(idx, 'low_conf')
+    # R1: low confidence (skipped when conf_thr == 0.0, e.g. TrackNet blob_sum)
+    if conf_thr > 0.0:
+        for idx in det_idx:
+            if df.loc[idx, 'ball_conf'] < conf_thr:
+                _set(idx, 'low_conf')
 
     # R2: out-of-bounds
     for idx in det_idx:
@@ -506,7 +507,8 @@ def export(df, path):
 # Main pipeline function  (called by run_all_cameras.py)
 # ---------------------------------------------------------------------------
 
-def clean_df(df, calib_path, alpha_cli=None, beta_cli=None, label='', y_net=None):
+def clean_df(df, calib_path, alpha_cli=None, beta_cli=None, label='', y_net=None,
+             conf_thr=None):
     """
     Run the full cleaning pipeline on an already-loaded DataFrame.
 
@@ -520,6 +522,11 @@ def clean_df(df, calib_path, alpha_cli=None, beta_cli=None, label='', y_net=None
     y_net : float, optional
         Pixel V-coordinate of the net.  When provided, R9 (half-court
         excursion filter) is applied.
+    conf_thr : float or None
+        R1 confidence threshold.  Pass 0.0 to disable R1 entirely.
+        When None (default), auto-detects: if max(ball_conf) > 1.5 the data
+        is assumed to be TrackNet blob_sum (not a [0,1] probability) and R1
+        is skipped; otherwise CONF_THR=0.50 is used.
 
     Returns
     -------
@@ -530,6 +537,15 @@ def clean_df(df, calib_path, alpha_cli=None, beta_cli=None, label='', y_net=None
     y_near = cal.get('y_near')
     fps    = cal.get('fps', 25)
 
+    # Auto-detect conf threshold when not specified
+    if conf_thr is None:
+        max_conf = float(df['ball_conf'].max()) if 'ball_conf' in df.columns and len(df) > 0 else 0.0
+        if max_conf > 1.5:
+            conf_thr = 0.0   # TrackNet blob_sum — BallTracker threshold already applied
+            print("  [R1]    Skipped (TrackNet blob_sum detected, max_conf={:.2f})".format(max_conf))
+        else:
+            conf_thr = CONF_THR
+
     print(f"  [SPEED] {spd.describe(y_far, y_near)}")
     print(f"          SNAPBACK_MULT={SNAPBACK_MULT}  "
           f"ISOLATION_MULT={ISOLATION_MULT}  "
@@ -539,7 +555,7 @@ def clean_df(df, calib_path, alpha_cli=None, beta_cli=None, label='', y_net=None
     print()
     print(f"  [LOAD]  {len(df)} frames | {int(df['detected'].sum())} raw detections")
 
-    df = flag_point_outliers(df, spd)
+    df = flag_point_outliers(df, spd, conf_thr)
     df = flag_static_clusters(df)
     df = flag_short_segments(df)
     df = flag_crossing_violations(df, cal)

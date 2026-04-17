@@ -323,25 +323,36 @@ class TennisVisualizer:
         u_col: str,
         v_col: str,
         correction: float = NET_SPEED_CORRECTION,
+        max_lookback: int = 30,
     ) -> float:
         """
         Compute world-coordinate ball speed at frame idx (km/h).
-        `correction` divides the raw estimate to compensate for
-        single-camera perspective overestimation (default 2.0 for net height).
+
+        Scans backward up to max_lookback rows to find the last valid ball
+        position before idx — this handles gap-bridging crossings where the
+        immediately preceding row may be NaN.
         """
         if idx < 1:
             return 0.0
-        w0 = self.to_world(df.loc[idx - 1, u_col], df.loc[idx - 1, v_col])
-        w1 = self.to_world(df.loc[idx,     u_col], df.loc[idx,     v_col])
-        if w0 and w1:
-            dist_m = np.hypot(w1[0] - w0[0], w1[1] - w0[1])
-            spd    = dist_m * fps * 3.6 / correction
-            # Amateur-court progressive dampening: hard to exceed 100 km/h
-            if spd > 60:
-                spd = 60 + (spd - 60) * 0.2
-            spd = min(spd, 110)
-            if 10 <= spd:
-                return spd
+        w1 = self.to_world(df.loc[idx, u_col], df.loc[idx, v_col])
+        if w1 is None:
+            return 0.0
+
+        # Find last valid row before idx
+        prev_idx = idx - 1
+        while prev_idx >= max(0, idx - max_lookback):
+            w0 = self.to_world(df.loc[prev_idx, u_col], df.loc[prev_idx, v_col])
+            if w0 is not None:
+                frame_gap = max(idx - prev_idx, 1)
+                dist_m = np.hypot(w1[0] - w0[0], w1[1] - w0[1])
+                spd    = dist_m * fps * 3.6 / frame_gap / correction
+                if spd > 60:
+                    spd = 60 + (spd - 60) * 0.2
+                spd = min(spd, 110)
+                if spd >= 10:
+                    return spd
+                return 0.0
+            prev_idx -= 1
         return 0.0
 
     def _detect_crossings(

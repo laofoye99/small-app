@@ -1,36 +1,39 @@
 """
 live_pipeline.py
 ================
-Real-time RTSP → TrackNet → clean → sync → rally → API pipeline.
+Continuous tennis analysis pipeline.
 
-Two camera subprocesses run continuous TrackNet inference (from the
-tennis-3d-tracking library) and push detection rows into per-camera queues.
-The main process accumulates rows, then periodically flushes them through:
+Source selection
+----------------
+At startup each camera is probed independently:
+  1. Try to open the configured RTSP URL (5-second timeout).
+  2. If unreachable, fall back to the default local video file.
 
-    clean_df()  →  sync_dfs()  →  detect rallies  →  POST to API
+Pass --local to skip the RTSP probe entirely.
+Pass --cam66-url / --cam68-url to override the source for a specific camera.
 
-Flush triggers (whichever comes first):
-  1. Inactivity: no detections from EITHER camera for INACTIVITY_SEC.
-  2. Force flush: every FORCE_FLUSH_SEC even if cameras are still active.
+Detection  (every frame, both cameras)
+---------------------------------------
+  Ball  : WASBDetector – sliding deque of 3 frames, runs every frame
+  Pose  : YOLOPoseEstimator – runs every frame
+  Two camera workers run in parallel threads; GPU inference is serialised by
+  a shared lock so the GPU is never double-submitted.
 
-Both triggers respect a minimum buffer size so a 3-second pause right after
-startup doesn't cause a premature, near-empty flush.
+Processing chain
+-----------------
+  row buffer → _rows_to_df → clean_df → sync_dfs → report_df (API)
+
+Flush policy
+-------------
+  Local file  : single final flush after both workers reach EOF
+  RTSP        : periodic flush – inactivity (10 s) or force every 5 min
 
 Usage
 -----
-    # Dry run — build payloads and print to stdout, no HTTP POST:
-    python live_pipeline.py --dry-run
-
-    # Production run:
-    python live_pipeline.py
-
-    # Override RTSP streams (e.g. for local replay tests):
-    python live_pipeline.py \\
-        --cam66-url rtsp://localhost:8554/cam66 \\
-        --cam68-url rtsp://localhost:8554/cam68
-
-    # Use CPU inference (no CUDA):
-    python live_pipeline.py --device cpu
+  python live_pipeline.py                          # auto-detect source
+  python live_pipeline.py --local                  # force local files
+  python live_pipeline.py --dry-run                # no API POST
+  python live_pipeline.py --cam66-url path/to.mp4 --cam68-url path/to.mp4
 """
 
 from __future__ import annotations
@@ -38,39 +41,42 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import multiprocessing as mp
 import sys
 import threading
 import time
-from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import cv2
 import numpy as np
 import pandas as pd
+import torch
 
 # ---------------------------------------------------------------------------
-# Settings (all paths computed from config.yaml / auto-detect)
+# Path bootstrap
 # ---------------------------------------------------------------------------
 
-# Ensure small-app root is in path so all sibling modules import cleanly.
 _HERE = Path(__file__).parent.resolve()
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from settings import (
-    HOME, CAMERAS_CFG, HOMOGRAPHY_JSON,
-    TRACKNET_MODEL as _DEFAULT_MODEL,
-    MODEL_DEVICE, MODEL_FPS, MODEL_FRAMES_IN, MODEL_FRAMES_OUT, MODEL_THRESHOLD,
+    CAMERAS_CFG,
+    HOMOGRAPHY_JSON,
+    WASB_MODEL     as _DEFAULT_WASB,
+    YOLO_MODEL     as _DEFAULT_YOLO,
+    OUTPUT_DIR     as _DEFAULT_OUTPUT,
+    CALIB_CAM66,
+    CALIB_CAM68,
+    MODEL_FPS,
+    MODEL_DEVICE,
 )
+from detectors.wasb_detector import WASBDetector
+from detectors.yolo_pose import YOLOPoseEstimator
 from postprocess.cleaner_core import clean_df
 from scripts.sync_cameras import sync_dfs
-from scripts.report_api import (
-    API_URL,
-    report_df as _report_df_api,
-)
-from scripts.analysis_module import TennisRallySegmenter, TennisVisualizer
+from scripts.report_api import API_URL, report_df as _report_df_api
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -84,219 +90,163 @@ logging.basicConfig(
 logger = logging.getLogger('live_pipeline')
 
 # ---------------------------------------------------------------------------
-# Default configuration  (values come from settings.py / config.yaml)
+# Defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL_PATH = str(_DEFAULT_MODEL)
+DEFAULT_WASB_PATH  = str(_DEFAULT_WASB)
+DEFAULT_YOLO_PATH  = str(_DEFAULT_YOLO)
 DEFAULT_HOM_PATH   = str(HOMOGRAPHY_JSON)
 DEFAULT_DEVICE     = MODEL_DEVICE
 DEFAULT_FPS        = MODEL_FPS
-FRAMES_IN          = MODEL_FRAMES_IN
-FRAMES_OUT         = MODEL_FRAMES_OUT
-INPUT_SIZE         = (288, 512)   # (H, W)
-THRESHOLD          = MODEL_THRESHOLD
+DEFAULT_OUTPUT_DIR = str(_DEFAULT_OUTPUT)
 
-# RTSP URLs and per-camera metadata — pulled from settings / config.yaml
-_CAM66_RTSP = CAMERAS_CFG.get('cam66', {}).get(
-    'rtsp_url', 'rtsp://admin:motion168@192.168.1.66:554/Streaming/Channels/101'
-)
-_CAM68_RTSP = CAMERAS_CFG.get('cam68', {}).get(
-    'rtsp_url', 'rtsp://admin:motion168@192.168.1.68:554/Streaming/Channels/101'
-)
-
-# Camera metadata: merge settings config with local calib paths
-from settings import CALIB_CAM66, CALIB_CAM68
-_CAM_DEFAULTS = {
+_CAM_CFG: Dict[str, dict] = {
     'cam66': {
-        'homography_key': CAMERAS_CFG.get('cam66', {}).get('homography_key', 'cam66'),
+        'rtsp_url':       CAMERAS_CFG.get('cam66', {}).get(
+                              'rtsp_url',
+                              'rtsp://admin:motion168@192.168.1.66:554/Streaming/Channels/101'),
+        'local_fallback': str(_HERE / 'uploads' / 'cam66_video.mp4'),
         'calib_json':     str(CALIB_CAM66),
         'y_net':          float(CAMERAS_CFG.get('cam66', {}).get('y_net', 238.0)),
+        'serial':         CAMERAS_CFG.get('cam66', {}).get('serial', 'FV9942593'),
+        'homography_key': CAMERAS_CFG.get('cam66', {}).get('homography_key', 'cam66'),
     },
     'cam68': {
-        'homography_key': CAMERAS_CFG.get('cam68', {}).get('homography_key', 'cam68'),
+        'rtsp_url':       CAMERAS_CFG.get('cam68', {}).get(
+                              'rtsp_url',
+                              'rtsp://admin:motion168@192.168.1.68:554/Streaming/Channels/101'),
+        'local_fallback': str(_HERE / 'uploads' / 'cam68_video.mp4'),
         'calib_json':     str(CALIB_CAM68),
         'y_net':          float(CAMERAS_CFG.get('cam68', {}).get('y_net', 285.0)),
+        'serial':         CAMERAS_CFG.get('cam68', {}).get('serial', 'FV9942588'),
+        'homography_key': CAMERAS_CFG.get('cam68', {}).get('homography_key', 'cam68'),
     },
 }
 
-# Flush policy
-INACTIVITY_SEC    = 10.0    # seconds of silence before triggering flush
-FORCE_FLUSH_SEC   = 300.0   # force flush every 5 minutes regardless of activity
-MIN_FLUSH_ROWS    = 200     # minimum accumulated rows before any flush (~8 s at 25 fps)
-OVERLAP_SEC       = 30.0    # seconds of tail kept in buffer after each flush (boundary guard)
-
-# Buffer cap (memory guard: ~10 minutes per camera)
-MAX_BUFFER_ROWS = int(DEFAULT_FPS * 600)
+# Flush / buffer settings
+INACTIVITY_SEC  = 10.0
+FORCE_FLUSH_SEC = 300.0
+MIN_FLUSH_ROWS  = 200
+OVERLAP_SEC     = 30.0
+RECONNECT_DELAY = 3.0
+RTSP_TIMEOUT_MS = 5_000
 
 # ---------------------------------------------------------------------------
-# Camera subprocess entry point
+# Joint definitions
 # ---------------------------------------------------------------------------
 
-def _camera_worker(
-    name:            str,
-    rtsp_url:        str,
-    model_path:      str,
-    homography_path: str,
-    homography_key:  str,
-    app_root:        str,   # small-app root dir, added to sys.path in subprocess
-    result_queue:    mp.Queue,
-    stop_event:      mp.Event,
-    status_dict:     dict,
-    session_start_ts: float,
-    fps:             float = DEFAULT_FPS,
-    frames_in:       int   = FRAMES_IN,
-    frames_out:      int   = FRAMES_OUT,
-    device:          str   = DEFAULT_DEVICE,
-    input_size:      tuple = INPUT_SIZE,
-    threshold:       float = THRESHOLD,
-) -> None:
+_JOINT_MAP = [
+    ('ls', 'left_shoulder'),
+    ('rs', 'right_shoulder'),
+    ('le', 'left_elbow'),
+    ('re', 'right_elbow'),
+    ('lw', 'left_wrist'),
+    ('rw', 'right_wrist'),
+]
+
+_ALL_PLAYER_COLS = (
+    [f'p{p}_{j}_{c}' for p in range(2) for j, _ in _JOINT_MAP for c in ('u', 'v')]
+    + [f'p{p}_{c}' for p in range(2) for c in ('bx1', 'by1', 'bx2', 'by2')]
+)
+
+# ---------------------------------------------------------------------------
+# Source probing
+# ---------------------------------------------------------------------------
+
+def _probe_rtsp(url: str) -> bool:
+    """Return True if the RTSP stream is reachable within RTSP_TIMEOUT_MS."""
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, RTSP_TIMEOUT_MS)
+    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, RTSP_TIMEOUT_MS)
+    ok = cap.isOpened()
+    cap.release()
+    return ok
+
+
+def _resolve_source(
+    cam_name: str,
+    override: Optional[str],
+    force_local: bool,
+) -> tuple[str, bool]:
     """
-    Subprocess entry point: RTSP camera → TrackNet inference → detection rows.
+    Returns (url, is_rtsp).
 
-    Each detected frame is put into *result_queue* as a dict:
-        {
-            'camera_name': str,
-            'frame_id':    int,   # derived from timestamp at session_start_ts
-            'detected':    1,
-            'ball_u':      float, # pixel X
-            'ball_v':      float, # pixel Y
-            'ball_conf':   float,
-            'capture_ts':  float,
-        }
-
-    Runs until *stop_event* is set.
+    Priority:
+      1. --cam66-url / --cam68-url override → use as-is (RTSP if starts with rtsp://)
+      2. --local flag → skip probe, use local_fallback
+      3. Auto: probe RTSP; on failure use local_fallback
     """
-    # Re-add small-app root to path (Windows spawn starts a fresh interpreter)
-    if app_root not in sys.path:
-        sys.path.insert(0, app_root)
+    cfg = _CAM_CFG[cam_name]
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format=f'%(asctime)s  [%(name)s]  %(levelname)s  %(message)s',
-        datefmt='%H:%M:%S',
-    )
-    log = logging.getLogger(name)
+    if override is not None:
+        is_rtsp = override.lower().startswith('rtsp')
+        logger.info("[%s] Using override source: %s (rtsp=%s)", cam_name, override, is_rtsp)
+        return override, is_rtsp
 
-    try:
-        from tracking.camera_stream import CameraStream
-        from tracking.inference import create_detector
-        from tracking.postprocess import BallTracker
-    except ImportError as exc:
-        log.error("Import failed (tracking package not found in %s): %s", tracking_dir, exc)
-        status_dict['state'] = 'error'
-        status_dict['error_msg'] = str(exc)
-        return
+    if not force_local:
+        rtsp = cfg['rtsp_url']
+        logger.info("[%s] Probing RTSP %s …", cam_name, rtsp)
+        if _probe_rtsp(rtsp):
+            logger.info("[%s] RTSP reachable → live stream", cam_name)
+            return rtsp, True
+        logger.warning("[%s] RTSP unreachable → local fallback", cam_name)
 
-    log.info("Starting  rtsp=%s  model=%s  device=%s", rtsp_url, model_path, device)
-    status_dict['state'] = 'starting'
-
-    stream   = CameraStream(rtsp_url, name)
-    stream.start()
-
-    detector = None
-    tracker  = None
-    try:
-        detector = create_detector(
-            model_path, input_size, frames_in, frames_out, device,
-            detector_type='auto',
+    local = cfg['local_fallback']
+    if not Path(local).exists():
+        raise FileNotFoundError(
+            f"[{cam_name}] Local fallback not found: {local}"
         )
-        if not getattr(detector, 'returns_blobs', False):
-            tracker = BallTracker(original_size=(1920, 1080), threshold=threshold)
-        log.info("Inference ready (device=%s)", device)
-    except Exception as exc:
-        log.warning("Model load failed — inference disabled: %s", exc)
-
-    status_dict['state'] = 'running'
-
-    frame_buffer:    list = []
-    ts_buffer:       list = []
-    last_frame_id:   int  = -1
-
-    while not stop_event.is_set():
-        frame, frame_id, _ts = stream.read()
-        if frame is None or frame_id == last_frame_id:
-            time.sleep(0.002)
-            continue
-        last_frame_id  = frame_id
-        capture_ts     = time.time()
-
-        frame = frame.copy()
-        # Mask camera OSD overlay (same as tennis-3d-tracking)
-        frame[0:41, 0:603] = 0
-
-        frame_buffer.append(frame)
-        ts_buffer.append(capture_ts)
-
-        if len(frame_buffer) < frames_in:
-            continue
-
-        if detector is None:
-            frame_buffer.clear()
-            ts_buffer.clear()
-            continue
-
-        try:
-            heatmaps = detector.infer(frame_buffer)
-        except Exception as exc:
-            log.error("Inference error: %s", exc)
-            frame_buffer.clear()
-            ts_buffer.clear()
-            continue
-
-        if getattr(detector, 'returns_blobs', False):
-            # MedianBGDetector path — not used by default (TrackNet is default)
-            frame_buffer.clear()
-            ts_buffer.clear()
-            continue
-
-        # TrackNet / HRNet path
-        for i in range(min(frames_out, len(heatmaps))):
-            blobs = tracker.process_heatmap_multi(heatmaps[i], max_blobs=1)
-            if not blobs:
-                continue
-
-            top       = blobs[0]
-            px        = top['pixel_x']
-            py        = top['pixel_y']
-            conf      = top['blob_sum']
-            c_ts      = ts_buffer[0] if ts_buffer else capture_ts
-
-            # Derive a monotonic frame_id from elapsed time since session start
-            derived_fid = round((c_ts - session_start_ts) * fps)
-
-            row = {
-                'camera_name': name,
-                'frame_id':    derived_fid,
-                'detected':    1,
-                'ball_u':      round(float(px),   2),
-                'ball_v':      round(float(py),   2),
-                'ball_conf':   round(float(conf), 4),
-                'capture_ts':  c_ts,
-            }
-            try:
-                result_queue.put_nowait(row)
-            except Exception:
-                pass  # queue full — drop frame
-
-        frame_buffer.clear()
-        ts_buffer.clear()
-
-    stream.stop()
-    status_dict['state'] = 'stopped'
-    log.info("Worker stopped")
-
+    logger.info("[%s] Using local file: %s", cam_name, local)
+    return local, False
 
 # ---------------------------------------------------------------------------
-# DataFrame helpers
+# Row builder
+# ---------------------------------------------------------------------------
+
+def _make_row(
+    cam_name:  str,
+    frame_id:  int,
+    detected:  bool,
+    ball_u:    Optional[float],
+    ball_v:    Optional[float],
+    ball_conf: float,
+    kp_sets:   list,
+) -> dict:
+    row: dict = {
+        'camera_name': cam_name,
+        'frame_id':    frame_id,
+        'detected':    int(detected),
+        'ball_u':      round(ball_u,    2) if ball_u    is not None else None,
+        'ball_v':      round(ball_v,    2) if ball_v    is not None else None,
+        'ball_conf':   round(ball_conf, 4),
+    }
+    for p_idx, kp in enumerate(kp_sets[:2]):
+        for j_abbr, j_attr in _JOINT_MAP:
+            joint = getattr(kp, j_attr, None)
+            if joint is not None:
+                row[f'p{p_idx}_{j_abbr}_u']    = round(float(joint[0]), 2)
+                row[f'p{p_idx}_{j_abbr}_v']    = round(float(joint[1]), 2)
+                row[f'p{p_idx}_{j_abbr}_conf'] = round(float(joint[2]), 4)
+            else:
+                row[f'p{p_idx}_{j_abbr}_u']    = None
+                row[f'p{p_idx}_{j_abbr}_v']    = None
+                row[f'p{p_idx}_{j_abbr}_conf'] = None
+        bbox = getattr(kp, 'bbox', None)
+        if bbox is not None:
+            row[f'p{p_idx}_bx1'] = round(float(bbox[0]), 1)
+            row[f'p{p_idx}_by1'] = round(float(bbox[1]), 1)
+            row[f'p{p_idx}_bx2'] = round(float(bbox[2]), 1)
+            row[f'p{p_idx}_by2'] = round(float(bbox[3]), 1)
+        else:
+            for c in ('bx1', 'by1', 'bx2', 'by2'):
+                row[f'p{p_idx}_{c}'] = None
+    return row
+
+# ---------------------------------------------------------------------------
+# DataFrame builder
 # ---------------------------------------------------------------------------
 
 def _rows_to_df(rows: List[dict]) -> pd.DataFrame:
-    """
-    Convert a list of detection-row dicts to a DataFrame suitable for clean_df().
-
-    Missing frame IDs are filled with detected=0 / NaN ball coords so that
-    clean_df's interpolator has a proper frame axis.
-    """
     if not rows:
         return pd.DataFrame(
             columns=['frame_id', 'detected', 'ball_u', 'ball_v', 'ball_conf']
@@ -309,240 +259,253 @@ def _rows_to_df(rows: List[dict]) -> pd.DataFrame:
         .reset_index(drop=True)
     )
 
-    # Drop the internal column before building the full index
-    extra_cols = [c for c in df.columns
-                  if c not in ('frame_id', 'detected', 'ball_u', 'ball_v', 'ball_conf',
-                               'capture_ts', 'camera_name')]
+    ball_cols   = ['frame_id', 'detected', 'ball_u', 'ball_v', 'ball_conf']
+    player_cols = [c for c in _ALL_PLAYER_COLS if c in df.columns]
 
     min_fid = int(df['frame_id'].min())
     max_fid = int(df['frame_id'].max())
-
-    full_fids = pd.RangeIndex(min_fid, max_fid + 1)
-    full = pd.DataFrame({'frame_id': full_fids})
-    full = full.merge(df[['frame_id', 'detected', 'ball_u', 'ball_v', 'ball_conf']],
-                      on='frame_id', how='left')
+    full = pd.DataFrame({'frame_id': pd.RangeIndex(min_fid, max_fid + 1)})
+    full = full.merge(df[ball_cols + player_cols], on='frame_id', how='left')
     full['detected']  = full['detected'].fillna(0).astype(int)
     full['ball_conf'] = full['ball_conf'].fillna(0.0)
 
+    for col in player_cols:
+        if col in full.columns:
+            full[col] = full[col].ffill(limit=5).bfill(limit=5)
+
     return full.reset_index(drop=True)
 
-
 # ---------------------------------------------------------------------------
-# Per-camera reporting from DataFrame — delegates to report_api.report_df()
-# ---------------------------------------------------------------------------
-
-def _report_df(
-    label:               str,
-    df:                  pd.DataFrame,
-    calib_json_path:     str,
-    y_net:               float,
-    homography_matrices: dict,
-    serial_number:       str,
-    session_start:       datetime,
-    fps:                 float = DEFAULT_FPS,
-    api_url:             str   = API_URL,
-    dry_run:             bool  = False,
-) -> int:
-    """Thin wrapper around scripts.report_api.report_df()."""
-    return _report_df_api(
-        label               = label,
-        df                  = df,
-        calib_json_path     = calib_json_path,
-        y_net               = y_net,
-        homography_matrices = homography_matrices,
-        serial_number       = serial_number,
-        video_start         = session_start,
-        fps                 = fps,
-        api_url             = api_url,
-        dry_run             = dry_run,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Main pipeline class
+# Pipeline
 # ---------------------------------------------------------------------------
 
 class LivePipeline:
     """
-    Orchestrates two camera subprocesses and a periodic flush→report loop.
+    Two-camera tennis analysis pipeline.
 
-    Camera workers run in ``mp.Process`` subprocesses.
-    Detection rows are consumed by a daemon thread into per-camera deques.
-    The flush thread checks inactivity / force-flush conditions and
-    dispatches clean → sync → report.
+    Each camera runs in its own worker thread that reads frames sequentially
+    and performs WASB + YOLO inference.  GPU inference is serialised by a
+    shared lock so both threads share one GPU without contention.
+
+    For RTSP sources the flush loop triggers periodic clean → sync → report
+    cycles.  For local files a single final flush runs after both workers
+    reach EOF.
     """
 
     def __init__(
         self,
-        cam66_url:      str   = _CAM66_RTSP,
-        cam68_url:      str   = _CAM68_RTSP,
-        model_path:     str   = DEFAULT_MODEL_PATH,
-        homography_path: str  = DEFAULT_HOM_PATH,
-        device:         str   = DEFAULT_DEVICE,
-        fps:            float = DEFAULT_FPS,
-        dry_run:        bool  = False,
-        api_url:        str   = API_URL,
-    ):
-        self.model_path      = model_path
-        self.homography_path = homography_path
-        self.device          = device
-        self.fps             = fps
-        self.dry_run         = dry_run
-        self.api_url         = api_url
+        cam66_url:           Optional[str] = None,
+        cam68_url:           Optional[str] = None,
+        wasb_weights:        str   = DEFAULT_WASB_PATH,
+        yolo_weights:        str   = DEFAULT_YOLO_PATH,
+        homography_path:     str   = DEFAULT_HOM_PATH,
+        device:              str   = DEFAULT_DEVICE,
+        fps:                 float = DEFAULT_FPS,
+        dry_run:             bool  = False,
+        api_url:             str   = API_URL,
+        ball_conf_threshold: float = 0.5,
+        kp_conf_threshold:   float = 0.3,
+        max_players:         int   = 2,
+        output_dir:          str   = DEFAULT_OUTPUT_DIR,
+        force_local:         bool  = False,
+    ) -> None:
+        self.fps        = fps
+        self.dry_run    = dry_run
+        self.api_url    = api_url
+        self.ball_thr   = ball_conf_threshold
+        self.kp_thr     = kp_conf_threshold
+        self.max_players = max_players
+        self.output_dir = output_dir
 
-        # Merge runtime RTSP URLs into camera config (serial from settings/config.yaml)
-        self._cam_cfg = {
-            'cam66': {**_CAM_DEFAULTS['cam66'], 'rtsp_url': cam66_url,
-                      'serial': CAMERAS_CFG.get('cam66', {}).get('serial', 'FV9942593')},
-            'cam68': {**_CAM_DEFAULTS['cam68'], 'rtsp_url': cam68_url,
-                      'serial': CAMERAS_CFG.get('cam68', {}).get('serial', 'FV9942588')},
-        }
+        # Device
+        if device in ('cuda', 'auto'):
+            self._device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            if device == 'cuda' and not torch.cuda.is_available():
+                logger.warning("CUDA requested but not available – using CPU")
+        else:
+            self._device = torch.device('cpu')
+        logger.info("Inference device: %s", self._device)
 
-        self._session_start_ts: float      = time.time()
-        self._session_start:    datetime   = datetime.now(tz=timezone.utc)
+        # Models (shared, one instance each)
+        logger.info("Loading WASB detector …")
+        self._wasb = WASBDetector(wasb_weights, self._device)
 
-        # Per-camera raw detection rows (thread-safe via _buf_lock)
-        self._buffers:    Dict[str, List[dict]] = {k: [] for k in self._cam_cfg}
-        self._last_det_ts: Dict[str, float]     = {k: 0.0 for k in self._cam_cfg}
-        self._buf_lock = threading.Lock()
+        logger.info("Loading YOLO pose estimator …")
+        self._yolo = YOLOPoseEstimator(yolo_weights, self._device)
 
-        self._last_flush_ts = time.time()
-        self._flush_count   = 0
+        # Shared inference lock – serialises GPU access across both workers
+        self._infer_lock = threading.Lock()
 
-        self._stop = mp.Event()
+        # Resolve video sources
+        overrides = {'cam66': cam66_url, 'cam68': cam68_url}
+        self._sources: Dict[str, tuple[str, bool]] = {}
+        for cam_name in _CAM_CFG:
+            url, is_rtsp = _resolve_source(cam_name, overrides[cam_name], force_local)
+            self._sources[cam_name] = (url, is_rtsp)
 
-        # mp resources
-        self._result_queues:  Dict[str, mp.Queue] = {}
-        self._worker_procs:   Dict[str, mp.Process] = {}
-        self._status_dicts:   Dict[str, dict] = {}
+        self._is_local = all(not is_rtsp for _, is_rtsp in self._sources.values())
+        logger.info(
+            "Sources: %s",
+            {n: ('rtsp' if r else 'local') for n, (_, r) in self._sources.items()},
+        )
 
-        # Load homography matrices once
+        # Homography
         hom_p = Path(homography_path)
         if not hom_p.exists():
             raise FileNotFoundError(f"Homography JSON not found: {hom_p}")
         with open(hom_p, 'r', encoding='utf-8') as fh:
             self._homography = json.load(fh)
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+        # Per-camera row buffers
+        self._buffers:     Dict[str, List[dict]] = {k: [] for k in _CAM_CFG}
+        self._last_det_ts: Dict[str, float]      = {k: 0.0 for k in _CAM_CFG}
+        self._buf_lock = threading.Lock()
 
-    def start(self) -> None:
-        """Start camera subprocesses and background threads."""
-        mgr = mp.Manager()
-
-        for name, cfg in self._cam_cfg.items():
-            q      = mp.Queue(maxsize=2000)
-            status = mgr.dict()
-            status.update({'state': 'starting', 'error_msg': '', 'fps': 0.0,
-                           'inference_enabled': True})
-
-            proc = mp.Process(
-                target=_camera_worker,
-                name=f'camera_{name}',
-                kwargs=dict(
-                    name             = name,
-                    rtsp_url         = cfg['rtsp_url'],
-                    model_path       = self.model_path,
-                    homography_path  = self.homography_path,
-                    homography_key   = cfg['homography_key'],
-                    app_root         = str(_HERE),
-                    result_queue     = q,
-                    stop_event       = self._stop,
-                    status_dict      = status,
-                    session_start_ts = self._session_start_ts,
-                    fps              = self.fps,
-                    frames_in        = FRAMES_IN,
-                    frames_out       = FRAMES_OUT,
-                    device           = self.device,
-                    input_size       = INPUT_SIZE,
-                    threshold        = THRESHOLD,
-                ),
-                daemon=True,
-            )
-            proc.start()
-            logger.info("Started subprocess for %s  (pid=%d)", name, proc.pid)
-
-            self._result_queues[name]  = q
-            self._worker_procs[name]   = proc
-            self._status_dicts[name]   = status
-
-        # Consumer thread: queues → in-memory buffers
-        self._consumer_thread = threading.Thread(
-            target=self._consume_loop, name='consumer', daemon=True
-        )
-        self._consumer_thread.start()
-
-        # Flush thread: periodic clean → sync → report
-        self._flush_thread = threading.Thread(
-            target=self._flush_loop, name='flush', daemon=True
-        )
-        self._flush_thread.start()
-
-    def stop(self) -> None:
-        """Signal all workers and threads to stop."""
-        logger.info("Stopping pipeline…")
-        self._stop.set()
-        for name, proc in self._worker_procs.items():
-            proc.terminate()
-            proc.join(timeout=8)
-            logger.info("[%s] subprocess joined (exitcode=%s)", name, proc.exitcode)
-
-    def run(self) -> None:
-        """Start pipeline and block until Ctrl-C."""
-        self.start()
-        logger.info(
-            "Pipeline running.  dry_run=%s  cameras=%s",
-            self.dry_run, list(self._cam_cfg)
-        )
-        try:
-            while True:
-                time.sleep(15)
-                self._log_status()
-        except KeyboardInterrupt:
-            logger.info("KeyboardInterrupt — shutting down")
-        finally:
-            self.stop()
+        self._session_start  = datetime.now(tz=timezone.utc)
+        self._last_flush_ts  = time.time()
+        self._flush_count    = 0
+        self._stop           = threading.Event()
 
     # ------------------------------------------------------------------
-    # Consumer thread
+    # Camera worker thread
     # ------------------------------------------------------------------
 
-    def _consume_loop(self) -> None:
-        """Read detection rows from all camera queues and append to buffers."""
+    def _camera_worker(self, cam_name: str) -> None:
+        url, is_rtsp = self._sources[cam_name]
+        log          = logging.getLogger(f'live_pipeline.{cam_name}')
+        ball_buffer  = self._wasb.make_buffer()
+        frame_id     = 0
+
+        # Non-overlapping batch accumulators
+        # Accumulate exactly frames_in (3) frames, then run WASB once,
+        # emit 3 rows, and clear – avoiding per-frame inference overhead.
+        batch_frames: list[tuple[int, np.ndarray, int, int]] = []  # (fid, frame, h, w)
+        batch_yolo:   list[list]                              = []  # YOLO results per frame
+
         while not self._stop.is_set():
-            any_read = False
-            for name, q in self._result_queues.items():
-                try:
-                    row = q.get_nowait()
-                except Exception:
-                    continue
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            if is_rtsp:
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10_000)
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10_000)
 
-                # Skip MedianBG blob_block messages (not used by default)
-                if not isinstance(row, dict) or row.get('type') == 'blob_block':
-                    continue
+            if not cap.isOpened():
+                cap.release()
+                if not is_rtsp:
+                    log.error("Cannot open local file: %s", url)
+                    break
+                log.warning("Cannot open RTSP %s – retrying in %.0fs", url, RECONNECT_DELAY)
+                self._stop.wait(RECONNECT_DELAY)
+                continue
 
-                c_ts = float(row.get('capture_ts', time.time()))
+            log.info("Opened: %s", url)
 
+            while not self._stop.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    log.info("%s – end of stream", url)
+                    break
+
+                # Mask camera OSD timestamp overlay
+                frame[0:41, 0:603] = 0
+
+                h, w = frame.shape[:2]
+
+                # YOLO pose runs every frame (under lock)
+                with self._infer_lock:
+                    kp_sets = self._yolo.estimate(frame, self.max_players)
+
+                # Push frame and YOLO result into accumulators
+                self._wasb.push_frame(frame, ball_buffer)
+                batch_frames.append((frame_id, frame, h, w))
+                batch_yolo.append(kp_sets)
+
+                # When 3 frames are accumulated, run WASB once for all 3
+                if len(batch_frames) == self._wasb.frames_in:
+                    _, _, bh, bw = batch_frames[0]
+                    with self._infer_lock:
+                        ball_results = self._wasb.detect_batch(
+                            ball_buffer, bh, bw, self.ball_thr
+                        )
+
+                    now_ts = time.time()
+                    any_detected = False
+                    rows_to_add: list[dict] = []
+
+                    for (fid, _, _, _), (detected, bu, bv, bconf), kps in zip(
+                        batch_frames, ball_results, batch_yolo
+                    ):
+                        row = _make_row(
+                            cam_name, fid,
+                            detected,
+                            bu if detected else None,
+                            bv if detected else None,
+                            bconf,
+                            kps,
+                        )
+                        rows_to_add.append(row)
+                        if detected:
+                            any_detected = True
+
+                    with self._buf_lock:
+                        self._buffers[cam_name].extend(rows_to_add)
+                        if any_detected:
+                            self._last_det_ts[cam_name] = now_ts
+
+                    ball_buffer.clear()
+                    batch_frames.clear()
+                    batch_yolo.clear()
+
+                frame_id += 1
+                if frame_id % 500 == 0:
+                    log.info("%d frames processed", frame_id)
+
+            cap.release()
+
+            if not is_rtsp:
+                break   # local file done
+
+            if not self._stop.is_set():
+                log.info("Reconnecting in %.0fs …", RECONNECT_DELAY)
+                self._stop.wait(RECONNECT_DELAY)
+
+        # Flush any partial batch at EOF (< 3 frames remaining)
+        if batch_frames and ball_buffer:
+            _, _, bh, bw = batch_frames[0]
+            try:
+                with self._infer_lock:
+                    ball_results = self._wasb.detect_batch(
+                        ball_buffer, bh, bw, self.ball_thr
+                    )
+                rows_to_add = []
+                any_detected = False
+                for (fid, _, _, _), (detected, bu, bv, bconf), kps in zip(
+                    batch_frames, ball_results, batch_yolo
+                ):
+                    row = _make_row(
+                        cam_name, fid,
+                        detected,
+                        bu if detected else None,
+                        bv if detected else None,
+                        bconf,
+                        kps,
+                    )
+                    rows_to_add.append(row)
+                    if detected:
+                        any_detected = True
                 with self._buf_lock:
-                    buf = self._buffers[name]
-                    buf.append(row)
-                    # Cap buffer to avoid unbounded memory growth
-                    if len(buf) > MAX_BUFFER_ROWS:
-                        del buf[:len(buf) - MAX_BUFFER_ROWS]
-                    self._last_det_ts[name] = c_ts
+                    self._buffers[cam_name].extend(rows_to_add)
+                    if any_detected:
+                        self._last_det_ts[cam_name] = time.time()
+            except Exception as exc:
+                log.warning("Partial batch flush failed: %s", exc)
 
-                any_read = True
-
-            if not any_read:
-                time.sleep(0.005)
+        log.info("Worker finished  total_frames=%d", frame_id)
 
     # ------------------------------------------------------------------
-    # Flush loop
+    # Flush loop  (RTSP mode only)
     # ------------------------------------------------------------------
 
     def _flush_loop(self) -> None:
-        """Periodically check conditions and trigger a pipeline flush."""
         while not self._stop.is_set():
             time.sleep(2.0)
             now = time.time()
@@ -551,142 +514,167 @@ class LivePipeline:
                 buf_sizes = {n: len(b) for n, b in self._buffers.items()}
                 last_dets = dict(self._last_det_ts)
 
-            min_rows = min(buf_sizes.values()) if buf_sizes else 0
+            if min(buf_sizes.values(), default=0) < MIN_FLUSH_ROWS:
+                continue
 
-            if min_rows < MIN_FLUSH_ROWS:
-                continue  # not enough data yet
-
-            # Inactivity condition: all cameras have been quiet
-            active_cams = [n for n, t in last_dets.items() if t > 0]
-            all_quiet = bool(active_cams) and all(
-                now - last_dets[n] >= INACTIVITY_SEC for n in active_cams
+            active    = [n for n, t in last_dets.items() if t > 0]
+            all_quiet = bool(active) and all(
+                now - last_dets[n] >= INACTIVITY_SEC for n in active
             )
-
             force = (now - self._last_flush_ts) >= FORCE_FLUSH_SEC
 
             if all_quiet or force:
-                reason = 'inactivity' if all_quiet else 'force_flush'
-                logger.info("Flush triggered (%s)  buf_sizes=%s", reason, buf_sizes)
-                self._do_flush()
+                reason = 'inactivity' if all_quiet else 'force'
+                logger.info("Flush triggered (%s)  buf=%s", reason, buf_sizes)
+                try:
+                    self._do_flush(final=False)
+                except Exception as exc:
+                    logger.error("Flush error (continuing): %s", exc, exc_info=True)
                 self._last_flush_ts = now
 
     # ------------------------------------------------------------------
-    # Core flush: clean → sync → report
+    # Core flush: rows → clean → sync → report
     # ------------------------------------------------------------------
 
-    def _do_flush(self) -> None:
-        """
-        Extract buffered rows, run the clean→sync→rally→POST pipeline.
-
-        After the flush, the last OVERLAP_SEC seconds of rows are kept so
-        that rallies straddling a flush boundary are fully captured next time.
-        """
-        overlap_rows = int(self.fps * OVERLAP_SEC)
+    def _do_flush(self, final: bool = False) -> None:
+        overlap_rows = 0 if final else int(self.fps * OVERLAP_SEC)
 
         with self._buf_lock:
             snapshots: Dict[str, List[dict]] = {}
-            for name in self._cam_cfg:
+            for name in _CAM_CFG:
                 buf = self._buffers[name]
-                snapshots[name] = list(buf)           # snapshot
-                # Retain tail for next flush
-                self._buffers[name] = buf[-overlap_rows:] if len(buf) > overlap_rows else list(buf)
+                snapshots[name] = list(buf)
+                self._buffers[name] = (
+                    [] if final
+                    else (buf[-overlap_rows:] if len(buf) > overlap_rows else list(buf))
+                )
 
         self._flush_count += 1
-        flush_id = self._flush_count
-        logger.info("=== Flush #%d  rows=%s ===",
-                    flush_id, {n: len(r) for n, r in snapshots.items()})
+        fid = self._flush_count
+        row_counts = {n: len(r) for n, r in snapshots.items()}
+        logger.info("=== Flush #%d  final=%s  rows=%s ===", fid, final, row_counts)
 
-        # ── Stage 1: rows → DataFrames ────────────────────────────────
+        # Stage 1: rows → DataFrames
         dfs: Dict[str, pd.DataFrame] = {}
         for name, rows in snapshots.items():
             if not rows:
-                logger.warning("[flush#%d] No rows for %s — skip", flush_id, name)
+                logger.warning("[flush#%d] %s: no rows – skipping", fid, name)
                 continue
             dfs[name] = _rows_to_df(rows)
-            logger.info("[flush#%d] %s: %d raw rows → %d df rows (frame %d–%d)",
-                        flush_id, name, len(rows), len(dfs[name]),
-                        dfs[name]['frame_id'].min(), dfs[name]['frame_id'].max())
+            logger.info(
+                "[flush#%d] %s: %d rows  frame %d–%d",
+                fid, name, len(dfs[name]),
+                int(dfs[name]['frame_id'].min()),
+                int(dfs[name]['frame_id'].max()),
+            )
 
         if len(dfs) < 2:
-            logger.warning("[flush#%d] Need both cameras — skipping", flush_id)
+            logger.warning("[flush#%d] Need both cameras – skipping flush", fid)
             return
 
-        # ── Stage 2: clean each camera ────────────────────────────────
+        # Stage 2: clean each camera
         cleaned: Dict[str, pd.DataFrame] = {}
         for name, df_raw in dfs.items():
-            cfg = self._cam_cfg[name]
+            cfg = _CAM_CFG[name]
             try:
                 df_clean, summary = clean_df(
                     df_raw,
-                    calib_path = cfg['calib_json'],
-                    y_net      = cfg['y_net'],
-                    label      = name,
+                    calib_path=cfg['calib_json'],
+                    y_net=cfg['y_net'],
+                    label=name,
                 )
                 cleaned[name] = df_clean
                 logger.info(
-                    "[flush#%d] %s clean: %d raw det → %d clean det  outliers=%d",
-                    flush_id, name,
-                    summary['raw_detections'], summary['clean'],
+                    "[flush#%d] %s clean: raw=%d  outliers=%d  interp=%d",
+                    fid, name,
+                    summary['raw_detections'],
                     summary['outliers'],
+                    summary['interpolated'],
                 )
             except Exception as exc:
-                logger.error("[flush#%d] clean_df failed for %s: %s", flush_id, name, exc,
-                             exc_info=True)
+                logger.error("[flush#%d] clean_df failed for %s: %s",
+                             fid, name, exc, exc_info=True)
                 return
 
-        # ── Stage 3: sync cameras ─────────────────────────────────────
+        # Stage 3: sync cameras
         try:
             df66, df68, sync_res = sync_dfs(
                 cleaned['cam66'], cleaned['cam68'],
                 label_a='cam66', label_b='cam68',
             )
             logger.info("[flush#%d] sync: tau=%d fr  SNR=%.2f",
-                        flush_id, sync_res['tau_offset'], sync_res['corr_snr'])
+                        fid, sync_res['tau_offset'], sync_res['corr_snr'])
         except Exception as exc:
-            logger.error("[flush#%d] sync_dfs failed: %s", flush_id, exc, exc_info=True)
+            logger.error("[flush#%d] sync_dfs failed: %s", fid, exc, exc_info=True)
             return
 
-        # ── Stage 4: detect rallies + POST ────────────────────────────
-        for name, df_synced in [('cam66', df66), ('cam68', df68)]:
-            cfg = self._cam_cfg[name]
+        # Stage 4: rally detection + API report
+        for name, df_synced in (('cam66', df66), ('cam68', df68)):
+            cfg = _CAM_CFG[name]
             try:
-                sent = _report_df(
+                sent = _report_df_api(
                     label               = name,
                     df                  = df_synced,
                     calib_json_path     = cfg['calib_json'],
                     y_net               = cfg['y_net'],
                     homography_matrices = self._homography,
                     serial_number       = cfg['serial'],
-                    session_start       = self._session_start,
+                    video_start         = self._session_start,
                     fps                 = self.fps,
                     api_url             = self.api_url,
                     dry_run             = self.dry_run,
                 )
-                logger.info("[flush#%d] %s → %d payloads sent", flush_id, name, sent)
+                logger.info("[flush#%d] %s → %d payloads sent", fid, name, sent)
             except Exception as exc:
                 logger.error("[flush#%d] report failed for %s: %s",
-                             flush_id, name, exc, exc_info=True)
+                             fid, name, exc, exc_info=True)
 
     # ------------------------------------------------------------------
-    # Status logging
+    # Entry point
     # ------------------------------------------------------------------
 
-    def _log_status(self) -> None:
-        with self._buf_lock:
-            buf_sizes  = {n: len(b) for n, b in self._buffers.items()}
-            last_dets  = dict(self._last_det_ts)
-        now = time.time()
-        for name, status in self._status_dicts.items():
-            idle = now - last_dets.get(name, now)
-            logger.info(
-                "[%s]  state=%-10s  fps=%4.1f  buf=%5d rows  idle=%.0fs",
-                name,
-                status.get('state', '?'),
-                float(status.get('fps', 0)),
-                buf_sizes.get(name, 0),
-                idle,
+    def run(self) -> None:
+        logger.info(
+            "Pipeline starting  local=%s  dry_run=%s  device=%s",
+            self._is_local, self.dry_run, self._device,
+        )
+
+        # One worker thread per camera
+        workers = [
+            threading.Thread(
+                target=self._camera_worker,
+                name=f'worker_{name}',
+                args=(name,),
+                daemon=True,
             )
+            for name in _CAM_CFG
+        ]
+        for t in workers:
+            t.start()
 
+        # Flush loop thread for RTSP mode
+        if not self._is_local:
+            threading.Thread(
+                target=self._flush_loop,
+                name='flush_loop',
+                daemon=True,
+            ).start()
+
+        try:
+            while any(t.is_alive() for t in workers):
+                time.sleep(2.0)
+        except KeyboardInterrupt:
+            logger.info("KeyboardInterrupt – shutting down")
+            self._stop.set()
+            for t in workers:
+                t.join(timeout=10)
+
+        # Final flush after all workers finish
+        logger.info("All workers finished – running final flush")
+        try:
+            self._do_flush(final=True)
+        except Exception as exc:
+            logger.error("Final flush error: %s", exc, exc_info=True)
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -694,41 +682,29 @@ class LivePipeline:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description='Real-time RTSP tennis ball tracking → API reporting pipeline',
+        description='Tennis analysis pipeline – RTSP live or local file',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument(
-        '--dry-run', action='store_true',
-        help='Build and print payloads to stdout; do NOT POST to the API',
-    )
-    p.add_argument(
-        '--cam66-url', default=_CAM66_RTSP,
-        help='RTSP stream URL for cam66 (near baseline)',
-    )
-    p.add_argument(
-        '--cam68-url', default=_CAM68_RTSP,
-        help='RTSP stream URL for cam68 (far baseline)',
-    )
-    p.add_argument(
-        '--model', default=DEFAULT_MODEL_PATH, metavar='PATH',
-        help='TrackNet model weights (.pt)',
-    )
-    p.add_argument(
-        '--homography', default=DEFAULT_HOM_PATH, metavar='PATH',
-        help='homography_matrices.json path',
-    )
-    p.add_argument(
-        '--device', default=DEFAULT_DEVICE, choices=['cuda', 'cpu'],
-        help='Inference device',
-    )
-    p.add_argument(
-        '--fps', type=float, default=DEFAULT_FPS,
-        help='Camera frame rate (used for frame_id derivation and timing)',
-    )
-    p.add_argument(
-        '--api-url', default=API_URL,
-        help='POST endpoint URL',
-    )
+    p.add_argument('--dry-run',     action='store_true',
+                   help='Print API payloads, do not POST')
+    p.add_argument('--local',       action='store_true',
+                   help='Skip RTSP probe, use local video files directly')
+    p.add_argument('--cam66-url',   default=None, metavar='URL',
+                   help='Override cam66 source (RTSP URL or file path)')
+    p.add_argument('--cam68-url',   default=None, metavar='URL',
+                   help='Override cam68 source (RTSP URL or file path)')
+    p.add_argument('--wasb-model',  default=DEFAULT_WASB_PATH, metavar='PATH')
+    p.add_argument('--yolo-model',  default=DEFAULT_YOLO_PATH, metavar='PATH')
+    p.add_argument('--homography',  default=DEFAULT_HOM_PATH,  metavar='PATH')
+    p.add_argument('--device',      default=DEFAULT_DEVICE,
+                   choices=['auto', 'cuda', 'cpu'])
+    p.add_argument('--fps',         type=float, default=DEFAULT_FPS)
+    p.add_argument('--ball-conf',   type=float, default=0.5,
+                   help='WASB detection confidence threshold')
+    p.add_argument('--kp-conf',     type=float, default=0.3,
+                   help='YOLO keypoint visibility threshold')
+    p.add_argument('--api-url',     default=API_URL)
+    p.add_argument('--output-dir',  default=DEFAULT_OUTPUT_DIR)
     return p
 
 
@@ -736,22 +712,25 @@ def main() -> None:
     args = _build_parser().parse_args()
 
     if args.dry_run:
-        logger.info("*** DRY-RUN MODE — payloads will be printed, not POSTed ***")
+        logger.info("*** DRY-RUN MODE – payloads printed, not POSTed ***")
 
     pipeline = LivePipeline(
-        cam66_url       = args.cam66_url,
-        cam68_url       = args.cam68_url,
-        model_path      = args.model,
-        homography_path = args.homography,
-        device          = args.device,
-        fps             = args.fps,
-        dry_run         = args.dry_run,
-        api_url         = args.api_url,
+        cam66_url           = args.cam66_url,
+        cam68_url           = args.cam68_url,
+        wasb_weights        = args.wasb_model,
+        yolo_weights        = args.yolo_model,
+        homography_path     = args.homography,
+        device              = args.device,
+        fps                 = args.fps,
+        dry_run             = args.dry_run,
+        api_url             = args.api_url,
+        ball_conf_threshold = args.ball_conf,
+        kp_conf_threshold   = args.kp_conf,
+        output_dir          = args.output_dir,
+        force_local         = args.local,
     )
     pipeline.run()
 
 
 if __name__ == '__main__':
-    # Required on Windows for multiprocessing to work correctly
-    mp.freeze_support()
     main()

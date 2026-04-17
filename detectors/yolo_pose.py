@@ -153,11 +153,19 @@ class YOLOPoseEstimator:
         if len(boxes) == 0:
             return []
 
+        # Step 1: take the top max_players candidates by bbox area
+        # (filters out distant spectators / officials who have small boxes)
         areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-        order = np.argsort(-areas)
+        area_order = np.argsort(-areas)[:max_players]
+
+        # Step 2: among those candidates, sort by bbox centre-Y descending
+        # so that p0 = near-field player (higher pixel-V, closer to camera)
+        # and p1 = far-field player — consistent with _near_player_prefix logic.
+        y_centers  = (boxes[area_order, 1] + boxes[area_order, 3]) / 2
+        order      = area_order[np.argsort(-y_centers)]
 
         players: List[KeypointSet] = []
-        for idx in order[:max_players]:
+        for idx in order:
             kp = KeypointSet(bbox=tuple(boxes[idx].tolist()))
             for attr, ki in self._JOINTS.items():
                 x, y = kp_xy[idx, ki]
